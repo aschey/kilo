@@ -18,7 +18,7 @@ use nix::{
         tcgetattr, tcsetattr, ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, Termios,
     },
 };
-use ropey::Rope;
+use ropey::{Rope, RopeSlice};
 
 ioctl_read_bad!(read_winsize, TIOCGWINSZ, winsize);
 
@@ -71,6 +71,7 @@ struct Editor {
     cursor_row: usize,
     cursor_col: usize,
     row_offset: usize,
+    col_offset: usize,
     rope: Rope,
 }
 
@@ -90,6 +91,7 @@ impl Editor {
             cursor_row: 0,
             cursor_col: 0,
             row_offset: 0,
+            col_offset: 0,
             rope: Rope::default(),
         })
     }
@@ -126,6 +128,13 @@ impl Editor {
         if self.cursor_row >= self.row_offset + self.screen_rows {
             self.row_offset = self.cursor_row - self.screen_rows + 1;
         }
+
+        if self.cursor_col < self.col_offset {
+            self.col_offset = self.cursor_col;
+        }
+        if self.cursor_col >= self.col_offset + self.screen_cols {
+            self.col_offset = self.cursor_col - self.screen_cols + 1;
+        }
     }
 
     fn editor_draw_rows(&mut self) -> io::Result<()> {
@@ -150,17 +159,17 @@ impl Editor {
                     self.stdout.write_all(b"~")?;
                 }
             } else {
-                let mut line_slice = self.rope.line(file_row);
-                if line_slice.len_chars() > 0 && line_slice.char(line_slice.len_chars() - 1) == '\n'
-                {
-                    line_slice = line_slice.slice(..line_slice.len_chars() - 1);
-                }
+                let mut line_slice = trim_newline(self.rope.line(file_row));
 
-                if line_slice.len_chars() > self.screen_cols {
-                    line_slice = line_slice.slice(..self.screen_cols);
+                let col_len = (line_slice.len_chars()
+                    - self.col_offset.min(line_slice.len_chars()))
+                .min(self.screen_cols);
+                if col_len > 0 {
+                    line_slice = line_slice.slice(self.col_offset..self.col_offset + col_len);
+
+                    let s: Cow<str> = line_slice.into();
+                    self.stdout.write_all(s.as_bytes())?;
                 }
-                let s: Cow<str> = line_slice.into();
-                self.stdout.write_all(s.as_bytes())?;
             }
 
             if y < self.screen_rows - 1 {
@@ -192,7 +201,7 @@ impl Editor {
             &mut self.stdout,
             "\x1b[{};{}H",
             self.cursor_row - self.row_offset + 1,
-            self.cursor_col + 1
+            self.cursor_col - self.col_offset + 1
         )?;
         // h - set mode
         // ?25 - cursor
@@ -206,10 +215,14 @@ impl Editor {
     fn editor_move_cursor(&mut self, key: EditorKey) {
         match key {
             EditorKey::ArrowLeft if self.cursor_col > 0 => self.cursor_col -= 1,
-            EditorKey::ArrowRight if self.cursor_col < self.screen_cols => self.cursor_col += 1,
+            EditorKey::ArrowRight
+                if self.cursor_col < self.current_row_len().max(self.screen_cols) =>
+            {
+                self.cursor_col += 1
+            }
             EditorKey::ArrowUp if self.cursor_row > 0 => self.cursor_row -= 1,
             EditorKey::ArrowDown
-                if self.cursor_row < (self.rope.len_lines() - 1).max(self.screen_rows) =>
+                if self.cursor_row < self.rope.len_lines().max(self.screen_rows) - 1 =>
             {
                 self.cursor_row += 1
             }
@@ -219,6 +232,24 @@ impl Editor {
             EditorKey::End => self.cursor_col = self.screen_cols,
             _ => {}
         }
+
+        let row_len = self.current_row_len();
+        if self.cursor_col > row_len {
+            self.cursor_col = row_len;
+        }
+    }
+
+    fn get_row(&self, row: usize) -> RopeSlice {
+        let row = self.rope.line(row);
+        trim_newline(row)
+    }
+
+    fn row_len(&self, row: usize) -> usize {
+        self.get_row(row).len_chars()
+    }
+
+    fn current_row_len(&self) -> usize {
+        self.row_len(self.cursor_row)
     }
 
     fn editor_read_key(&self) -> io::Result<EditorKey> {
@@ -337,5 +368,13 @@ impl Editor {
         // The supplied termios struct should contain the original terminal attributes before any modifications
 
         tcsetattr(self.stdin_fd, SetArg::TCSAFLUSH, &self.orig_termios)
+    }
+}
+
+fn trim_newline(row: RopeSlice) -> RopeSlice {
+    if row.len_chars() > 0 && row.char(row.len_chars() - 1) == '\n' {
+        row.slice(..row.len_chars() - 1)
+    } else {
+        row
     }
 }
