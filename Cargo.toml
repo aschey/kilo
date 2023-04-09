@@ -8,3 +8,4 @@ version = "0.1.0"
 [dependencies]
 libc = "0.2.141"
 nix = {version = "0.26.2", default-features = false, features = ["ioctl", "term"]}
+ropey = "1.6.0"

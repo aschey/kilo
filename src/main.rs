@@ -1,7 +1,11 @@
 use std::{
-    io::{self, Read, StdoutLock, Write},
+    borrow::Cow,
+    env::args,
+    fs::File,
+    io::{self, BufReader, Read, Stdout, Write},
     mem,
     os::fd::AsRawFd,
+    path::Path,
     slice,
 };
 
@@ -14,6 +18,7 @@ use nix::{
         tcgetattr, tcsetattr, ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, Termios,
     },
 };
+use ropey::Rope;
 
 ioctl_read_bad!(read_winsize, TIOCGWINSZ, winsize);
 
@@ -57,20 +62,22 @@ enum EditorKey {
     Other(char),
 }
 
-struct Editor<'a> {
+struct Editor {
     orig_termios: Termios,
     stdin_fd: i32,
-    stdout: StdoutLock<'a>,
+    stdout: Stdout,
     screen_rows: usize,
     screen_cols: usize,
     cursor_row: usize,
     cursor_col: usize,
+    row_offset: usize,
+    rope: Rope,
 }
 
-impl<'a> Editor<'a> {
+impl Editor {
     fn new() -> io::Result<Self> {
         let stdin_fd = io::stdin().as_raw_fd();
-        let stdout = io::stdout().lock();
+        let stdout = io::stdout();
         // Read current termios settings
         let termios = tcgetattr(stdin_fd)?;
         let (screen_rows, screen_cols) = Self::get_window_size()?;
@@ -82,12 +89,19 @@ impl<'a> Editor<'a> {
             screen_cols: screen_cols as usize,
             cursor_row: 0,
             cursor_col: 0,
+            row_offset: 0,
+            rope: Rope::default(),
         })
     }
 
     fn run(&mut self) -> io::Result<()> {
         // Use a new copy of the termios instance so we can restore the original state later
         self.enable_raw_mode()?;
+        let args: Vec<_> = args().collect();
+        if args.len() > 1 {
+            self.editor_open(Path::new(&args[1]))?;
+        }
+
         loop {
             self.editor_refresh_screen()?;
             if !self.editor_process_keypress()? {
@@ -96,34 +110,69 @@ impl<'a> Editor<'a> {
         }
     }
 
-    /*** output ***/
-    fn editor_draw_rows(&mut self) -> io::Result<()> {
-        for y in 0..self.screen_rows - 1 {
-            if y == self.screen_rows / 3 {
-                let mut message = "Kilo editor -- version 0.0.1";
-                if message.len() > self.screen_cols {
-                    message = &message[..self.screen_cols];
-                }
+    /*** file i/o ***/
+    fn editor_open(&mut self, path: &Path) -> io::Result<()> {
+        self.rope = Rope::from_reader(BufReader::new(File::open(path)?))?;
+        Ok(())
+    }
 
-                let mut padding = (self.screen_cols - message.len()) / 2;
-                if padding > 0 {
-                    self.stdout.write_all(b"~")?;
-                    padding -= 1;
-                }
-                write!(&mut self.stdout, "{}{message}", " ".repeat(padding))?;
-            } else {
-                self.stdout.write_all(b"~")?;
-            }
+    /*** output ***/
+    fn editor_scroll(&mut self) {
+        // If cursor is above visible window, scroll up to where cursor is
+        if self.cursor_row < self.row_offset {
+            self.row_offset = self.cursor_row;
+        }
+        // If cursor is below visible window, scroll down to where cursor is
+        if self.cursor_row >= self.row_offset + self.screen_rows {
+            self.row_offset = self.cursor_row - self.screen_rows + 1;
+        }
+    }
+
+    fn editor_draw_rows(&mut self) -> io::Result<()> {
+        for y in 0..self.screen_rows {
             // K - erase in line (clear current line)
             self.stdout.write_all(b"\x1b[K")?;
-            self.stdout.write_all(b"\r\n")?;
+            let file_row = y + self.row_offset;
+            if self.rope.len_chars() == 0 || file_row >= self.rope.len_lines() {
+                if self.rope.len_chars() == 0 && y == self.screen_rows / 3 {
+                    let mut message = "Kilo editor -- version 0.0.1";
+                    if message.len() > self.screen_cols {
+                        message = &message[..self.screen_cols];
+                    }
+
+                    let mut padding = (self.screen_cols - message.len()) / 2;
+                    if padding > 0 {
+                        self.stdout.write_all(b"~")?;
+                        padding -= 1;
+                    }
+                    write!(&mut self.stdout, "{}{message}", " ".repeat(padding))?;
+                } else {
+                    self.stdout.write_all(b"~")?;
+                }
+            } else {
+                let mut line_slice = self.rope.line(file_row);
+                if line_slice.len_chars() > 0 && line_slice.char(line_slice.len_chars() - 1) == '\n'
+                {
+                    line_slice = line_slice.slice(..line_slice.len_chars() - 1);
+                }
+
+                if line_slice.len_chars() > self.screen_cols {
+                    line_slice = line_slice.slice(..self.screen_cols);
+                }
+                let s: Cow<str> = line_slice.into();
+                self.stdout.write_all(s.as_bytes())?;
+            }
+
+            if y < self.screen_rows - 1 {
+                self.stdout.write_all(b"\r\n")?;
+            }
         }
-        self.stdout.write_all(b"~")?;
-        self.stdout.write_all(b"\x1b[K")?;
+
         Ok(())
     }
 
     fn editor_refresh_screen(&mut self) -> io::Result<()> {
+        self.editor_scroll();
         // escape sequence
         // \x1b (27) - escape character (mapped to ESC on keyboard)
         // [ - sequence start
@@ -142,7 +191,7 @@ impl<'a> Editor<'a> {
         write!(
             &mut self.stdout,
             "\x1b[{};{}H",
-            self.cursor_row + 1,
+            self.cursor_row - self.row_offset + 1,
             self.cursor_col + 1
         )?;
         // h - set mode
@@ -159,7 +208,11 @@ impl<'a> Editor<'a> {
             EditorKey::ArrowLeft if self.cursor_col > 0 => self.cursor_col -= 1,
             EditorKey::ArrowRight if self.cursor_col < self.screen_cols => self.cursor_col += 1,
             EditorKey::ArrowUp if self.cursor_row > 0 => self.cursor_row -= 1,
-            EditorKey::ArrowDown if self.cursor_row < self.screen_rows => self.cursor_row += 1,
+            EditorKey::ArrowDown
+                if self.cursor_row < (self.rope.len_lines() - 1).max(self.screen_rows) =>
+            {
+                self.cursor_row += 1
+            }
             EditorKey::PageUp => self.cursor_row = 0,
             EditorKey::PageDown => self.cursor_row = self.screen_rows,
             EditorKey::Home => self.cursor_col = 0,
