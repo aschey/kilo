@@ -214,11 +214,22 @@ impl Editor {
     /*** input ***/
     fn editor_move_cursor(&mut self, key: EditorKey) {
         match key {
-            EditorKey::ArrowLeft if self.cursor_col > 0 => self.cursor_col -= 1,
-            EditorKey::ArrowRight
-                if self.cursor_col < self.current_row_len().max(self.screen_cols) =>
-            {
-                self.cursor_col += 1
+            EditorKey::ArrowLeft => {
+                if self.cursor_col > 0 {
+                    self.cursor_col -= 1;
+                } else if self.cursor_row > 0 {
+                    // Move to end of previous line
+                    self.cursor_row -= 1;
+                    self.cursor_col = self.current_row_len();
+                }
+            }
+            EditorKey::ArrowRight => {
+                if self.cursor_col < self.current_row_len() {
+                    self.cursor_col += 1;
+                } else if self.cursor_row < self.rope.len_lines().max(self.screen_rows) - 1 {
+                    self.cursor_row += 1;
+                    self.cursor_col = 0;
+                }
             }
             EditorKey::ArrowUp if self.cursor_row > 0 => self.cursor_row -= 1,
             EditorKey::ArrowDown
