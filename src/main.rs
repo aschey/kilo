@@ -26,6 +26,8 @@ const fn ctrl_key(b: u8) -> char {
     (b & 0b00011111) as char
 }
 
+const TAB_SIZE: usize = 4;
+
 /*** init ***/
 
 fn main() -> io::Result<()> {
@@ -115,7 +117,27 @@ impl Editor {
     /*** file i/o ***/
     fn editor_open(&mut self, path: &Path) -> io::Result<()> {
         self.rope = Rope::from_reader(BufReader::new(File::open(path)?))?;
+        let rows = self.rope.len_lines();
+        for i in 0..rows {
+            self.editor_update_row(i);
+        }
         Ok(())
+    }
+
+    /*** row operations ***/
+    fn editor_update_row(&mut self, row: usize) {
+        let mut i = 0;
+        let start_char = self.rope.line_to_char(row);
+        while i < self.rope.line(row).len_chars() {
+            let line = self.rope.line(row);
+            if line.char(i) == '\t' {
+                self.rope.remove(start_char + i..start_char + i + 1);
+                self.rope.insert(start_char + i, &" ".repeat(TAB_SIZE));
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /*** output ***/
@@ -256,7 +278,11 @@ impl Editor {
     }
 
     fn row_len(&self, row: usize) -> usize {
-        self.get_row(row).len_chars()
+        if row < self.rope.len_lines() {
+            self.get_row(row).len_chars()
+        } else {
+            0
+        }
     }
 
     fn current_row_len(&self) -> usize {
